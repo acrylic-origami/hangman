@@ -39,8 +39,8 @@ def run():
 		# from a given guess, we split into all of the new positions and task them to count for each sub. But the distribution is just meant for making decisions on the next letter to choose: the actual probability of being wrong is given from the score distribution of the terms that don't have the next chosen letter. Note we have to recalculate the distributions updating the arrays separately, the hit array and the fail array: these are the two dimensions. And each node yields two outcomes, one for success and one for failure to the next most likely letter
 		# That makes sense. To queue for BFS I may have to just be prudent in how I push into the queue, just to make sure I go along the failures before I go along the axis of successes. Also note that if I do want to just make conditional probabilities in the DB then I'll have to include the failure probabilities relative to the parent. And I guess the number of failures as well. Or I can just index them properly. Each stores the index relative to the parent letter_agg, as well as the configuration? This is also unique, which makes it hard to store into a DB other than as a JSON object since it's a list of tuples. The BFS will be dominated by the last layer, I may just hold this in memory until I find a good way to represent it on disk, maybe even just as a flat JSON.
 		# I need to know the probability of the match failing which happens if we choose something that doesn't contain the most likely letter, which is distinct from the score of the words with the most likely letter: I need to get the sum of the scores of all the words so I can do the universal difference/ratio
-		# Q = [(M(e=[3]), V())]
-		Q = [(M(e=[3], r=[5]), V('t'))]
+		Q = [(M(), V())]
+		# Q = [(M(e=[3], r=[5]), V('t'))]
 		while len(Q) > 0:
 			q = Q.pop(randint(0, len(Q) - 1))
 			hits, fails = q
@@ -50,11 +50,12 @@ def run():
 			hitset = list(hits.keys())
 			sys.stdout.write('Scoring\r')
 			cur.execute('''
-				SELECT COUNT(*), SUM(score) FROM words w
-				''' + "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))])
-				+ '''
-				WHERE NOT (w.wa && %s :: CHAR(1)[])''',
-				tuple(flat_hits + [list(fails)])
+				SELECT COUNT(*), SUM(score) FROM wordwide w
+				''' + # "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))])
+				'''
+				WHERE NOT (w.wa && %s :: CHAR(1)[])'''
+				+ "".join([' AND w.n%s=%%s' % h[0] for h in hits.keys()]),
+				tuple([list(fails)] + list(hits.values()))
 			)
 			scorer = cur.fetchone()
 			num, tot = scorer
@@ -63,28 +64,31 @@ def run():
 				cur.execute('''
 					SELECT st1.letter, COUNT(*), SUM(st1.score) AS s FROM (
 					  SELECT l0.letter, w.score, w.id 
-					    FROM words w
-				''' + "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))]) +
+					    FROM wordwide w
+				''' + # "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))]) +
 				''' INNER JOIN letter_agg l0 ON l0.word = w.id
 						WHERE l0.letter <> ALL(%s) AND NOT (w.wa && %s :: CHAR(1)[])
-					) st1
+				''' + "".join([' AND w.n%s=%%s' % h[0] for h in hits.keys()]) +
+				''') st1
 					GROUP BY st1.letter
 					ORDER BY s DESC LIMIT 1''', # WHERE NOT (st1.letter ~ '[^A-Za-z]')
-					tuple(flat_hits + [hitset, list(fails)])
+					tuple([hitset, list(fails)] + list(hits.values()))
 				) # AND w.length = %s
 				nextr = cur.fetchone()
 				if nextr != None:
 					(next_letter, next_count, score) = nextr
 					sys.stdout.write('Assembling\r')
 					cur.execute('''
-						SELECT COUNT(*), l1.pos FROM words w
+						SELECT COUNT(*), l1.pos FROM wordwide w
 						INNER JOIN letter_agg l1 ON l1.word = w.id
-						''' + "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))]) +
+						''' + # "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))]) +
 						'''
 						WHERE l1.letter = %s AND NOT (w.wa && %s :: CHAR(1)[])
+						''' + "".join([' AND w.n%s=%%s' % h for h in hits.keys()]) +
+						'''
 						GROUP BY l1.pos
 						''',
-						tuple(flat_hits + [next_letter, list(fails)])
+						tuple([next_letter, list(fails)] + list(hits.values()))
 					)
 					nexts = cur.fetchall()
 					json.dump([flat_hits, list(fails), scorer, nextr, nexts], outf, cls=DecimalEncoder)
