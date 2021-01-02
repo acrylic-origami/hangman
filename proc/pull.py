@@ -2,7 +2,7 @@ import psycopg2 as pg
 from random import randint
 from queue import Queue, Empty
 import functools
-from pyrsistent import v as V
+from pyrsistent import v as V, m as M
 import pdb
 import decimal
 import json
@@ -31,7 +31,7 @@ def run():
 			pass
 			
 		if hitQ.qsize() == 0:
-			hitQ.put((V(), V())) # for each prefix I need to get the total score of all the remaining possibiliies and the scores of each of those as well, then break those into grouped letter placements. These will likely be very big so I would want to put these into the database if I can
+			hitQ.put((M(), V())) # for each prefix I need to get the total score of all the remaining possibiliies and the scores of each of those as well, then break those into grouped letter placements. These will likely be very big so I would want to put these into the database if I can
 		# it's important to track the number of failures to get to that point too, so the state seems to be:
 		# set of failed guesses
 		# pos-letter combinations
@@ -39,22 +39,22 @@ def run():
 		# from a given guess, we split into all of the new positions and task them to count for each sub. But the distribution is just meant for making decisions on the next letter to choose: the actual probability of being wrong is given from the score distribution of the terms that don't have the next chosen letter. Note we have to recalculate the distributions updating the arrays separately, the hit array and the fail array: these are the two dimensions. And each node yields two outcomes, one for success and one for failure to the next most likely letter
 		# That makes sense. To queue for BFS I may have to just be prudent in how I push into the queue, just to make sure I go along the failures before I go along the axis of successes. Also note that if I do want to just make conditional probabilities in the DB then I'll have to include the failure probabilities relative to the parent. And I guess the number of failures as well. Or I can just index them properly. Each stores the index relative to the parent letter_agg, as well as the configuration? This is also unique, which makes it hard to store into a DB other than as a JSON object since it's a list of tuples. The BFS will be dominated by the last layer, I may just hold this in memory until I find a good way to represent it on disk, maybe even just as a flat JSON.
 		# I need to know the probability of the match failing which happens if we choose something that doesn't contain the most likely letter, which is distinct from the score of the words with the most likely letter: I need to get the sum of the scores of all the words so I can do the universal difference/ratio
-		Q = [(V(*[(3, "e")]), V())]
+		# Q = [(M(e=[3]), V())]
+		Q = [(M(e=[3], r=[5]), V('t'))]
 		while len(Q) > 0:
 			q = Q.pop(randint(0, len(Q) - 1))
 			hits, fails = q
 			print(q)
-			flat_hits = [s for hit in hits for s in hit]
+			flat_hits = [h_ for h in hits.items() for h_ in h] # (h[0], list(h[1]))
 			num_hits = len(flat_hits) // 2
-			hitset = list(set(hit[1] for hit in hits))
+			hitset = list(hits.keys())
 			sys.stdout.write('Scoring\r')
 			cur.execute('''
 				SELECT COUNT(*), SUM(score) FROM words w
-				LEFT JOIN letter_agg l ON l.letter = ANY(%s) AND l.word = w.id
-				INNER JOIN ( SELECT l4.word, SUM(l4.num) AS s FROM letter_agg l4 WHERE letter = ANY(%s) GROUP BY l4.word ) st2 ON st2.word = w.id AND st2.s = %s
-				WHERE l.word IS NULL
-				''' + "".join([' AND w.l%s=%s'] * len(hits)),
-				tuple([list(fails), hitset, num_hits] + flat_hits)
+				''' + "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))])
+				+ '''
+				WHERE NOT (w.wa && %s :: CHAR(1)[])''',
+				tuple(flat_hits + [list(fails)])
 			)
 			scorer = cur.fetchone()
 			num, tot = scorer
@@ -62,18 +62,15 @@ def run():
 				sys.stdout.write('Searching\r')
 				cur.execute('''
 					SELECT st1.letter, COUNT(*), SUM(st1.score) AS s FROM (
-					  SELECT l3.letter, w.score, w.id 
+					  SELECT l0.letter, w.score, w.id 
 					    FROM words w
-					    LEFT JOIN letter_agg l2 ON w.id = l2.word AND l2.letter = ANY(%s)
-					    INNER JOIN letter_agg l3 ON l3.word = w.id
-						WHERE l2.word IS NULL AND l3.letter <> ALL(%s)
-					'''\
-					+ "".join([' AND w.l%s=%s'] * len(hits))\
-					+ ''') st1
-					INNER JOIN ( SELECT l4.word, SUM(l4.num) AS s FROM letter_agg l4 WHERE letter = ANY(%s) GROUP BY l4.word ) st2 ON st2.word = st1.id AND st2.s = %s
+				''' + "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))]) +
+				''' INNER JOIN letter_agg l0 ON l0.word = w.id
+						WHERE l0.letter <> ALL(%s) AND NOT (w.wa && %s :: CHAR(1)[])
+					) st1
 					GROUP BY st1.letter
 					ORDER BY s DESC LIMIT 1''', # WHERE NOT (st1.letter ~ '[^A-Za-z]')
-					tuple([list(fails), hitset] + flat_hits + [hitset, num_hits])
+					tuple(flat_hits + [hitset, list(fails)])
 				) # AND w.length = %s
 				nextr = cur.fetchone()
 				if nextr != None:
@@ -81,14 +78,13 @@ def run():
 					sys.stdout.write('Assembling\r')
 					cur.execute('''
 						SELECT COUNT(*), l1.pos FROM words w
-						LEFT JOIN letter_agg l ON l.letter = ANY(%s) AND l.word = w.id
 						INNER JOIN letter_agg l1 ON l1.word = w.id
-						INNER JOIN ( SELECT l4.word, SUM(l4.num) AS s FROM letter_agg l4 WHERE letter = ANY(%s) GROUP BY l4.word ) st2 ON st2.word = w.id AND st2.s = %s
-						WHERE l.letter IS NULL AND l1.letter = %s
-						'''\
-						+ "".join([' AND w.l%s=%s'] * len(hits))
-						+ ' GROUP BY l1.pos',
-						tuple([list(fails), hitset, num_hits, next_letter] + flat_hits)
+						''' + "".join([' INNER JOIN letter_agg lhit%d ON lhit%d.letter = %%s AND lhit%d.pos = %%s AND lhit%d.word = w.id' % (i, i, i, i) for i in range(len(hits))]) +
+						'''
+						WHERE l1.letter = %s AND NOT (w.wa && %s :: CHAR(1)[])
+						GROUP BY l1.pos
+						''',
+						tuple(flat_hits + [next_letter, list(fails)])
 					)
 					nexts = cur.fetchall()
 					json.dump([flat_hits, list(fails), scorer, nextr, nexts], outf, cls=DecimalEncoder)
@@ -96,8 +92,8 @@ def run():
 					outf.flush()
 					
 					for n in nexts:
-						Q.put((hits + [(n_, next_letter) for n_ in n[1] if n_ < 30], fails))
-					Q.put((hits, fails.append(next_letter)))
+						Q.append((hits.set(next_letter, n[1]), fails))
+					Q.append((hits, fails.append(next_letter)))
 				# pdb.set_trace()
 			
 if __name__ == '__main__':
